@@ -241,7 +241,7 @@
         </button>
       </div>
 
-      <!-- Tab: 靈感生成（版型，邏輯留白） -->
+      <!-- Tab: 靈感生成（版型） -->
       <section id="tab-idea" class="tab-panel">
         <div class="two-cols-desktop">
           <div class="card">
@@ -537,18 +537,15 @@
       let s = raw.trim();
       if (!s) return null;
 
-      // 直接 UC... 當成 channelId
       if (s.startsWith("UC") && s.length >= 10 && !s.includes(" ")) {
         return s;
       }
 
-      // URL: .../channel/UCxxxx
       const idMatch = s.match(/youtube\.com\/channel\/([^/?]+)/i);
       if (idMatch) {
         return idMatch[1];
       }
 
-      // URL: .../@handle 或純 @handle
       let handle = null;
       const handleUrlMatch = s.match(/youtube\.com\/(@[^/?]+)/i);
       if (handleUrlMatch) {
@@ -577,7 +574,113 @@
       return items[0].id;
     }
 
+    // 根據條件選擇搜尋策略
     async function searchPopularShorts(options) {
+      const { keyword, channelId } = options;
+      const useMostPopular = !keyword && !channelId; // 無關鍵字 & 無頻道 → 熱門排行榜模式
+
+      if (useMostPopular) {
+        return searchByMostPopular(options);
+      } else {
+        return searchBySearchAPI(options);
+      }
+    }
+
+    // 模式 A：無關鍵字 / 無頻道 → 使用 videos.list?chart=mostPopular
+    async function searchByMostPopular(options) {
+      const {
+        apiKey,
+        regionCode,
+        categoryId,
+        days,
+        maxSeconds,
+        minViews,
+        limit,
+        maxPages
+      } = options;
+
+      const now = new Date();
+      const afterDate = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+      const publishedAfter = afterDate.toISOString();
+
+      const videos = [];
+      let pageToken = null;
+      let pageCount = 0;
+
+      while (pageCount < maxPages && videos.length < limit * 3) {
+        const params = new URLSearchParams({
+          key: apiKey,
+          part: "snippet,statistics,contentDetails",
+          chart: "mostPopular",
+          maxResults: "50"
+        });
+
+        // mostPopular 建議一定要有 regionCode，沒有就用 US 當預設
+        params.set("regionCode", regionCode || "US");
+        if (categoryId) params.set("videoCategoryId", categoryId);
+        if (pageToken) params.set("pageToken", pageToken);
+
+        const url = `${YT_VIDEOS_BASE}?${params.toString()}`;
+        const res = await fetch(url);
+        const json = await res.json();
+        if (!res.ok) {
+          throw new Error(json.error?.message || "YouTube mostPopular API 錯誤");
+        }
+
+        const items = json.items || [];
+        items.forEach(item => {
+          const snippet = item.snippet || {};
+          const stats = item.statistics || {};
+          const contentDetails = item.contentDetails || {};
+          const publishedAt = snippet.publishedAt || "";
+          // 先用日期粗篩
+          if (publishedAt && new Date(publishedAt) < afterDate) return;
+
+          const durationSeconds = parseISODurationToSeconds(contentDetails.duration || "");
+          const views = Number(stats.viewCount || 0);
+          const thumbs = snippet.thumbnails || {};
+          const thumbUrl =
+            (thumbs.medium && thumbs.medium.url) ||
+            (thumbs.high && thumbs.high.url) ||
+            (thumbs.default && thumbs.default.url) ||
+            "";
+          const channelIdVal = snippet.channelId || "";
+          const channelUrl = channelIdVal
+            ? `https://www.youtube.com/channel/${channelIdVal}`
+            : "";
+
+          const v = {
+            id: item.id,
+            title: snippet.title || "(無標題)",
+            channel: snippet.channelTitle || "",
+            channelId: channelIdVal,
+            channelUrl,
+            publishedAt,
+            views,
+            durationSeconds,
+            thumbUrl,
+            url: `https://www.youtube.com/watch?v=${item.id}`
+          };
+
+          // 再用片長 & 觀看數嚴格篩
+          if (v.durationSeconds != null &&
+              v.durationSeconds <= maxSeconds &&
+              (minViews <= 0 || v.views >= minViews)) {
+            videos.push(v);
+          }
+        });
+
+        pageToken = json.nextPageToken || null;
+        pageCount += 1;
+        if (!pageToken) break;
+      }
+
+      videos.sort((a, b) => b.views - a.views);
+      return videos.slice(0, limit);
+    }
+
+    // 模式 B：有關鍵字或頻道 → 使用 search.list 再接 videos.list
+    async function searchBySearchAPI(options) {
       const {
         apiKey,
         regionCode,
@@ -672,7 +775,6 @@
         };
       });
 
-      // 前端長度 & 觀看數過濾：只留「短且爆量」
       videos = videos.filter(v => {
         if (v.durationSeconds == null) return false;
         if (v.durationSeconds > maxSeconds) return false;
@@ -728,7 +830,7 @@
       return d.toLocaleString("zh-TW");
     }
 
-    // 影片列表（含頻道網址）
+    // 影片結果
     function renderResults(videos) {
       resultsDiv.innerHTML = "";
       videos.forEach((v, idx) => {
